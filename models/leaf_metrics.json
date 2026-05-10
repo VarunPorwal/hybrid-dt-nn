@@ -1,0 +1,7 @@
+{
+  "3": { "num_samples": 1874, "r2": 0.4469, "adjusted_r2": 0.4434 },
+  "4": { "num_samples": 1064, "r2": 0.6930, "adjusted_r2": 0.6895 },
+  "6": { "num_samples": 1767, "r2": 0.8119, "adjusted_r2": 0.8106 },
+  "7": { "num_samples": 1012, "r2": 0.8556, "adjusted_r2": 0.8539 },
+  "8": { "num_samples": 1768, "r2": 0.8803, "adjusted_r2": 0.8795 }
+}
