@@ -1,11 +1,25 @@
 import numpy as np
+import random
+import logging
 from sklearn.base import BaseEstimator, RegressorMixin
 from sklearn.tree import DecisionTreeRegressor
+from sklearn.utils.validation import check_X_y, check_array, check_is_fitted
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import mean_squared_error
 import tensorflow as tf
 from tensorflow import keras
 import optuna
 
-# Disable optuna output to keep it clean unless user wants verbose
+# Setup standard logging
+logger = logging.getLogger(__name__)
+if not logger.hasHandlers():
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+    logger.setLevel(logging.INFO)
+
+# Disable optuna output by default
 optuna.logging.set_verbosity(optuna.logging.WARNING)
 
 class HybridTreeRegressor(BaseEstimator, RegressorMixin):
@@ -28,33 +42,7 @@ class HybridTreeRegressor(BaseEstimator, RegressorMixin):
                  nn_batch_size=32,
                  random_state=None,
                  verbose=0):
-        """
-        Parameters:
-        -----------
-        dt_max_depth : int, default=5
-            Maximum depth of the Decision Tree router.
-        dt_min_samples_leaf : int, default=50
-            Minimum samples required to be at a leaf node in the DT.
-        nn_min_samples : int, default=50
-            Minimum samples required in a leaf to train a Neural Network. If fewer, falls back to DT.
-        use_hpo : bool, default=False
-            If True, uses Optuna to optimize the Neural Network architecture per leaf.
-            If False, uses the fixed architecture defined by nn_hidden_layers and nn_units.
-        hpo_trials : int, default=20
-            Number of Optuna trials to run per leaf (only used if use_hpo=True).
-        nn_hidden_layers : int, default=2
-            Number of hidden layers in the NN (only used if use_hpo=False).
-        nn_units : int, default=64
-            Number of units per hidden layer in the NN (only used if use_hpo=False).
-        nn_epochs : int, default=30
-            Number of epochs to train each NN.
-        nn_batch_size : int, default=32
-            Batch size for NN training.
-        random_state : int, default=None
-            Random state for the Decision Tree and Optuna.
-        verbose : int, default=0
-            Verbosity level. 0=silent, 1=progress.
-        """
+        # Keep constructor absolutely pure to comply with sklearn get_params()
         self.dt_max_depth = dt_max_depth
         self.dt_min_samples_leaf = dt_min_samples_leaf
         self.nn_min_samples = nn_min_samples
@@ -67,18 +55,52 @@ class HybridTreeRegressor(BaseEstimator, RegressorMixin):
         self.random_state = random_state
         self.verbose = verbose
         
-        # Internal state
-        self.dt_ = None
-        self.leaf_models_ = {}
+    def _validate_params(self):
+        """Validates all input parameters strictly."""
+        if self.dt_max_depth <= 0:
+            raise ValueError("dt_max_depth must be > 0.")
+        if self.dt_min_samples_leaf <= 0:
+            raise ValueError("dt_min_samples_leaf must be > 0.")
+        if self.nn_min_samples <= 0:
+            raise ValueError("nn_min_samples must be > 0.")
+        if self.hpo_trials <= 0:
+            raise ValueError("hpo_trials must be > 0.")
+        if self.nn_hidden_layers <= 0:
+            raise ValueError("nn_hidden_layers must be > 0.")
+        if self.nn_units <= 0:
+            raise ValueError("nn_units must be > 0.")
+        if self.nn_epochs <= 0:
+            raise ValueError("nn_epochs must be > 0.")
+        if self.nn_batch_size <= 0:
+            raise ValueError("nn_batch_size must be > 0.")
 
     def fit(self, X, y):
         """Fit the model to the training data."""
-        # Ensure numpy arrays
-        X = np.asarray(X)
-        y = np.asarray(y)
+        self._validate_params()
         
         if self.verbose > 0:
-            print("1. Fitting Decision Tree...")
+            logger.setLevel(logging.INFO)
+        else:
+            logger.setLevel(logging.WARNING)
+            
+        # Enforce reproducibility
+        if self.random_state is not None:
+            np.random.seed(self.random_state)
+            tf.random.set_seed(self.random_state)
+            random.seed(self.random_state)
+
+        # Sklearn robust validation
+        X, y = check_X_y(X, y)
+        self.n_features_in_ = X.shape[1]
+        
+        # Internal state
+        self.dt_ = None
+        self.leaf_models_ = {}
+        self.leaf_sample_counts_ = {}
+        self.leaf_metrics_ = {}
+        self.leaf_ids_ = []
+        
+        logger.info("1. Fitting Decision Tree...")
             
         self.dt_ = DecisionTreeRegressor(
             max_depth=self.dt_max_depth,
@@ -89,44 +111,51 @@ class HybridTreeRegressor(BaseEstimator, RegressorMixin):
         
         # Get leaf ids for each training sample
         leaf_ids = self.dt_.apply(X)
-        unique_leaves = np.unique(leaf_ids)
+        self.leaf_ids_ = np.unique(leaf_ids)
         
-        if self.verbose > 0:
-            print(f"Decision Tree built with {len(unique_leaves)} leaves.")
-            print(f"2. Training Neural Networks (use_hpo={self.use_hpo})...")
+        logger.info(f"Decision Tree built with {len(self.leaf_ids_)} leaves.")
+        logger.info(f"2. Training Neural Networks (use_hpo={self.use_hpo})...")
             
-        for leaf_id in unique_leaves:
+        for i, leaf_id in enumerate(self.leaf_ids_, 1):
             idx = np.where(leaf_ids == leaf_id)[0]
             n_samples = len(idx)
+            self.leaf_sample_counts_[leaf_id] = n_samples
             
             if n_samples >= self.nn_min_samples:
                 X_leaf = X[idx]
                 y_leaf = y[idx]
                 
-                if self.verbose > 0:
-                    print(f"  -> Leaf {leaf_id} ({n_samples} samples): Training NN...")
+                logger.info(f"Training NN {i}/{len(self.leaf_ids_)} (Leaf {leaf_id}, {n_samples} samples)...")
                 
                 if self.use_hpo:
-                    nn = self._train_with_hpo(X_leaf, y_leaf)
+                    nn, val_mse, best_params = self._train_with_hpo(X_leaf, y_leaf)
                 else:
-                    nn = self._build_fixed_nn(X.shape[1])
-                    nn.fit(X_leaf, y_leaf, epochs=self.nn_epochs, batch_size=self.nn_batch_size, verbose=0)
+                    nn, val_mse, best_params = self._train_fixed_nn(X_leaf, y_leaf)
                 
                 self.leaf_models_[leaf_id] = nn
+                self.leaf_metrics_[leaf_id] = {
+                    "samples": n_samples,
+                    "val_mse": val_mse,
+                    "nn_used": True,
+                    "best_params": best_params
+                }
             else:
-                if self.verbose > 0:
-                    print(f"  -> Leaf {leaf_id} ({n_samples} samples): Skipping NN (fallback to DT).")
+                self.leaf_metrics_[leaf_id] = {
+                    "samples": n_samples,
+                    "val_mse": None,
+                    "nn_used": False,
+                    "best_params": None
+                }
                     
-        if self.verbose > 0:
-            print("Training complete!")
-            
+        logger.info("Training complete!")
         return self
 
     def predict(self, X):
         """Predict target values for X."""
-        X = np.asarray(X)
+        check_is_fitted(self, 'dt_')
+        X = check_array(X)
         
-        # Base predictions from DT
+        # Base predictions from DT (used as fallback)
         dt_preds = self.dt_.predict(X)
         
         # Get leaf assignments
@@ -134,84 +163,144 @@ class HybridTreeRegressor(BaseEstimator, RegressorMixin):
         
         final_preds = np.zeros(len(X))
         
-        for i in range(len(X)):
-            leaf = leaf_ids[i]
+        # Vectorized batch prediction by leaf
+        for leaf in np.unique(leaf_ids):
+            idx = np.where(leaf_ids == leaf)[0]
             if leaf in self.leaf_models_:
-                # Route to specific Neural Network
+                # Route to specific Neural Network and predict batch
                 nn = self.leaf_models_[leaf]
-                # reshape for keras inference
-                final_preds[i] = nn.predict(X[i].reshape(1, -1), verbose=0)[0][0]
+                leaf_preds = nn.predict(X[idx], verbose=0).flatten()
+                final_preds[idx] = leaf_preds
             else:
-                # Fallback
-                final_preds[i] = dt_preds[i]
+                # Fallback to Decision Tree batch
+                final_preds[idx] = dt_preds[idx]
                 
         return final_preds
         
-    def _build_fixed_nn(self, input_dim, hidden_layers=None, units=None, activation='relu', optimizer='adam'):
-        """Builds a basic Keras Sequential model."""
-        if hidden_layers is None:
-            hidden_layers = self.nn_hidden_layers
-        if units is None:
-            units = self.nn_units
-            
+    def _build_keras_model(self, input_dim, hidden_layers, units, activation, optimizer, lr=None):
+        """Builds a Keras Sequential model with specific parameters."""
         model = keras.Sequential()
-        model.add(keras.layers.InputLayer(input_shape=(input_dim,)))
+        model.add(keras.layers.InputLayer(shape=(input_dim,)))
         
+        # Handle custom activations (e.g., leaky_relu in strings)
         for _ in range(hidden_layers):
-            model.add(keras.layers.Dense(units, activation=activation))
+            if activation == "leaky_relu":
+                model.add(keras.layers.Dense(units))
+                model.add(keras.layers.LeakyReLU())
+            else:
+                model.add(keras.layers.Dense(units, activation=activation))
             
         model.add(keras.layers.Dense(1)) # Regression output
-        model.compile(optimizer=optimizer, loss='mse')
+        
+        # Configure optimizer
+        if lr is not None:
+            if optimizer == 'adam': opt = keras.optimizers.Adam(learning_rate=lr)
+            elif optimizer == 'adamw': opt = keras.optimizers.AdamW(learning_rate=lr)
+            elif optimizer == 'rmsprop': opt = keras.optimizers.RMSprop(learning_rate=lr)
+            elif optimizer == 'nadam': opt = keras.optimizers.Nadam(learning_rate=lr)
+            else: opt = optimizer
+        else:
+            opt = optimizer
+            
+        model.compile(optimizer=opt, loss='mse')
         return model
+
+    def _train_fixed_nn(self, X_leaf, y_leaf):
+        """Trains a fixed architecture NN with early stopping and validation."""
+        keras.backend.clear_session()
+        X_t, X_v, y_t, y_v = train_test_split(X_leaf, y_leaf, test_size=0.2, random_state=self.random_state)
+        
+        model = self._build_keras_model(
+            input_dim=X_leaf.shape[1], 
+            hidden_layers=self.nn_hidden_layers, 
+            units=self.nn_units, 
+            activation='relu', 
+            optimizer='adam'
+        )
+        
+        early_stopping = keras.callbacks.EarlyStopping(
+            monitor="val_loss", patience=5, restore_best_weights=True
+        )
+        
+        model.fit(X_t, y_t, validation_data=(X_v, y_v), epochs=self.nn_epochs, 
+                  batch_size=self.nn_batch_size, callbacks=[early_stopping], verbose=0)
+                  
+        preds = model.predict(X_v, verbose=0).flatten()
+        val_mse = mean_squared_error(y_v, preds)
+        
+        # Retrain FINAL model on the complete leaf
+        keras.backend.clear_session()
+        final_model = self._build_keras_model(
+            input_dim=X_leaf.shape[1], 
+            hidden_layers=self.nn_hidden_layers, 
+            units=self.nn_units, 
+            activation='relu', 
+            optimizer='adam'
+        )
+        final_model.fit(X_leaf, y_leaf, epochs=self.nn_epochs, 
+                        batch_size=self.nn_batch_size, verbose=0)
+        
+        fixed_params = {
+            "optimizer": "adam",
+            "activation": "relu",
+            "hidden_layers": self.nn_hidden_layers,
+            "units": self.nn_units,
+            "batch_size": self.nn_batch_size
+        }
+        
+        return final_model, val_mse, fixed_params
 
     def _train_with_hpo(self, X_leaf, y_leaf):
         """Runs Optuna HPO to find the best NN architecture for this specific leaf."""
-        from sklearn.metrics import mean_squared_error
+        X_t, X_v, y_t, y_v = train_test_split(X_leaf, y_leaf, test_size=0.2, random_state=self.random_state)
         
         def objective(trial):
-            # Hyperparameter search space
-            optimizer = trial.suggest_categorical("optimizer", ["adam", "rmsprop"])
-            activation = trial.suggest_categorical("activation", ["relu", "tanh", "elu"])
-            hidden_layers = trial.suggest_int("hidden_layers", 1, 3)
-            units = trial.suggest_categorical("units", [16, 32, 64, 128])
+            keras.backend.clear_session()
+            # Rich, constrained Optuna search space
+            optimizer = trial.suggest_categorical("optimizer", ["adam", "adamw", "rmsprop", "nadam"])
+            activation = trial.suggest_categorical("activation", ["relu", "leaky_relu", "elu", "tanh", "swish"])
+            hidden_layers = trial.suggest_int("hidden_layers", 1, 5)
+            units = trial.suggest_categorical("units", [8, 16, 32, 64, 128])
+            lr = trial.suggest_categorical("learning_rate", [1e-4, 3e-4, 1e-3, 3e-3])
+            batch_size = trial.suggest_categorical("batch_size", [16, 32, 64])
             
-            model = self._build_fixed_nn(
-                input_dim=X_leaf.shape[1], 
+            model = self._build_keras_model(
+                input_dim=X_t.shape[1], 
                 hidden_layers=hidden_layers, 
                 units=units, 
                 activation=activation, 
-                optimizer=optimizer
+                optimizer=optimizer,
+                lr=lr
             )
             
-            # Simple validation split for tuning (80/20)
-            split_idx = int(len(X_leaf) * 0.8)
-            X_t, X_v = X_leaf[:split_idx], X_leaf[split_idx:]
-            y_t, y_v = y_leaf[:split_idx], y_leaf[split_idx:]
-            
-            # If leaf is too small for split, just use training error
-            if len(X_v) == 0:
-                X_t, y_t = X_leaf, y_leaf
-                X_v, y_v = X_leaf, y_leaf
+            early_stopping = keras.callbacks.EarlyStopping(
+                monitor="val_loss", patience=5, restore_best_weights=True
+            )
                 
-            model.fit(X_t, y_t, epochs=self.nn_epochs, batch_size=self.nn_batch_size, verbose=0)
+            model.fit(X_t, y_t, validation_data=(X_v, y_v), epochs=self.nn_epochs, 
+                      batch_size=batch_size, callbacks=[early_stopping], verbose=0)
+                      
             preds = model.predict(X_v, verbose=0).flatten()
+            return mean_squared_error(y_v, preds)
             
-            mse = mean_squared_error(y_v, preds)
-            return mse
-            
-        study = optuna.create_study(direction="minimize")
+        study = optuna.create_study(direction="minimize", sampler=optuna.samplers.TPESampler(seed=self.random_state))
         study.optimize(objective, n_trials=self.hpo_trials)
         
         best_params = study.best_trial.params
+        final_val_mse = study.best_value
         
-        # Re-train on full leaf data using best parameters
-        final_model = self._build_fixed_nn(
-            input_dim=X_leaf.shape[1],
+        keras.backend.clear_session()
+        final_model = self._build_keras_model(
+            input_dim=X_t.shape[1],
             hidden_layers=best_params["hidden_layers"],
             units=best_params["units"],
             activation=best_params["activation"],
-            optimizer=best_params["optimizer"]
+            optimizer=best_params["optimizer"],
+            lr=best_params["learning_rate"]
         )
-        final_model.fit(X_leaf, y_leaf, epochs=self.nn_epochs, batch_size=self.nn_batch_size, verbose=0)
         
-        return final_model
+        # Retrain FINAL model on the complete leaf (X_leaf, y_leaf)
+        final_model.fit(X_leaf, y_leaf, epochs=self.nn_epochs, 
+                        batch_size=best_params["batch_size"], verbose=0)
+                        
+        return final_model, final_val_mse, best_params
