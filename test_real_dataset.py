@@ -32,7 +32,7 @@ def run_real_world_test():
         dt_max_depth=3,              # 3 levels deep
         dt_min_samples_leaf=20,      # At least 20 per leaf
         nn_min_samples=20,           # Only train NN if leaf has 20+
-        use_hpo=False,               # Keep it False for speed right now
+        use_hpo=False,               # Keep it true if want to use Optuna
         nn_epochs=50,                # Train NN for 50 epochs
         verbose=1
     )
